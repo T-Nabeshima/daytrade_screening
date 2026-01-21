@@ -9,14 +9,6 @@ from datetime import datetime, timedelta
 # ==========================================
 st.set_page_config(page_title="デイトレ運用エージェント", layout="wide")
 
-# 監視対象リスト（コードのみ定義）
-# ※本番ではここに日経225全銘柄を入れてください
-NIKKEI_225_SAMPLE = [
-    "7203.T", "9984.T", "8035.T", "6758.T", "6861.T", 
-    "6098.T", "6920.T", "4063.T", "7741.T", "8058.T",
-    "5401.T", "8306.T", "9432.T", "7011.T", "6501.T"
-]
-
 # スコア計算ルール
 SCORE_RULES = {
     "volume_accel": 2, # 出来高加速
@@ -30,36 +22,49 @@ SCORE_RULES = {
 # 1. データ取得・ロジック関数
 # ==========================================
 
-@st.cache_data(ttl=86400) # 銘柄名は24時間キャッシュ（遅いため）
-def fetch_ticker_names(tickers):
-    """yfinanceから銘柄名を取得する"""
-    name_map = {}
-    # プログレスバー表示（銘柄数が多いと時間がかかるため）
-    progress_text = "銘柄情報を取得中..."
-    my_bar = st.progress(0, text=progress_text)
-    
-    total = len(tickers)
-    for i, t in enumerate(tickers):
-        try:
-            # yfinanceのTickerオブジェクトから情報取得
-            ticker_info = yf.Ticker(t).info
-            # 日本語の省略名(shortName)があればそれを、なければlongName、なければコード
-            name = ticker_info.get('shortName', ticker_info.get('longName', t))
-            name_map[t] = name
-        except Exception:
-            name_map[t] = t
+@st.cache_data(ttl=2592000) # 30日間キャッシュ（月次更新イメージ）
+def fetch_nikkei225_list():
+    """
+    Wikipediaから日経225構成銘柄リスト（コード・社名）を取得する
+    """
+    url = "https://en.wikipedia.org/wiki/Nikkei_225"
+    try:
+        # htmlのテーブルを読み込む
+        dfs = pd.read_html(url)
+        # 通常、最初のテーブルが構成銘柄リスト
+        df = dfs[0]
         
-        # プログレスバー更新
-        my_bar.progress((i + 1) / total, text=f"{progress_text} ({i+1}/{total})")
+        # 必要なカラム: 'Ticker' (コード) と 'Company' (社名)
+        # コードに ".T" を付与し、社名との辞書を作成
+        ticker_map = {}
+        for _, row in df.iterrows():
+            code = str(row['Ticker'])
+            name = row['Company']
+            ticker_map[f"{code}.T"] = name
+            
+        return ticker_map
     
-    my_bar.empty() # バーを消す
-    return name_map
+    except Exception as e:
+        st.error(f"銘柄リストの取得に失敗しました: {e}")
+        # 失敗時のフォールバック（主要銘柄のみ）
+        return {
+            "7203.T": "Toyota Motor", "9984.T": "SoftBank Group",
+            "8035.T": "Tokyo Electron", "6758.T": "Sony Group",
+            "8306.T": "Mitsubishi UFJ"
+        }
 
 @st.cache_data(ttl=60) 
 def fetch_market_data(tickers):
-    """株価データの取得"""
+    """
+    株価データの取得
+    225銘柄一括取得のため、ダウンロード処理を最適化
+    """
     if not tickers:
         return None, None
+    
+    # プログレスバー表示
+    progress_text = "日経225全銘柄の株価を取得中..."
+    st.caption(progress_text)
     
     # 日足（5日分）
     daily_data = yf.download(
@@ -67,7 +72,7 @@ def fetch_market_data(tickers):
         group_by='ticker', auto_adjust=True, progress=False, threads=True
     )
     
-    # 分足（5日分：前日VWAP計算のため）
+    # 分足（5日分）
     intraday_data = yf.download(
         tickers, period="5d", interval="1m", 
         group_by='ticker', auto_adjust=True, progress=False, threads=True
@@ -79,25 +84,40 @@ def get_prev_vwap(df_m, prev_date_str):
     """前日の分足データからVWAPを計算"""
     try:
         prev_day_data = df_m.loc[prev_date_str]
-        if prev_day_data.empty:
-            return 0
+        if prev_day_data.empty: return 0
         v = prev_day_data['Volume']
         p = prev_day_data['Close']
-        vwap = (p * v).sum() / v.sum()
-        return vwap
+        if v.sum() == 0: return 0
+        return (p * v).sum() / v.sum()
     except:
         return 0
 
-def calculate_scores(tickers, names_map, daily_data, intraday_data):
+def calculate_scores(ticker_map, daily_data, intraday_data):
     """スクリーニングと各種数値の計算"""
     results = []
+    tickers = list(ticker_map.keys())
     
-    for t in tickers:
+    # プログレスバーで計算状況を表示
+    prog_bar = st.progress(0, text="スコア計算中...")
+    total_len = len(tickers)
+
+    for i, t in enumerate(tickers):
         try:
-            # データ切り出し
+            # プログレス更新（10銘柄ごとに更新して負荷軽減）
+            if i % 10 == 0:
+                prog_bar.progress((i / total_len), text=f"分析中... ({i}/{total_len})")
+
+            # データ切り出し（MultiIndex対応）
             if len(tickers) > 1:
+                # 銘柄がデータに含まれているか確認
+                if t not in daily_data.columns.levels[0]: continue
                 df_d = daily_data[t]
-                df_m = intraday_data[t] if t in intraday_data.columns.levels[0] else pd.DataFrame()
+                
+                # 分足チェック
+                if t in intraday_data.columns.levels[0]:
+                    df_m = intraday_data[t]
+                else:
+                    df_m = pd.DataFrame()
             else:
                 df_d = daily_data
                 df_m = intraday_data
@@ -110,8 +130,13 @@ def calculate_scores(tickers, names_map, daily_data, intraday_data):
             
             # --- 数値計算 ---
             prev_vol = prev['Volume']
-            avg_vol_5d = df_d['Volume'].iloc[-6:-1].mean()
-            if pd.isna(avg_vol_5d): avg_vol_5d = prev_vol
+            # 5日平均出来高
+            if len(df_d) >= 6:
+                avg_vol_5d = df_d['Volume'].iloc[-6:-1].mean()
+            else:
+                avg_vol_5d = prev_vol
+            
+            if pd.isna(avg_vol_5d) or avg_vol_5d == 0: avg_vol_5d = prev_vol
 
             prev_vwap = get_prev_vwap(df_m, prev_date)
             if prev_vwap == 0:
@@ -127,10 +152,11 @@ def calculate_scores(tickers, names_map, daily_data, intraday_data):
                 reasons.append("出来高増")
 
             # B. ギャップ
-            gap_rate = (today['Open'] - prev['Close']) / prev['Close']
-            if abs(gap_rate) >= 0.007:
-                score += SCORE_RULES['gap']
-                reasons.append("ギャップ")
+            if prev['Close'] > 0:
+                gap_rate = (today['Open'] - prev['Close']) / prev['Close']
+                if abs(gap_rate) >= 0.007:
+                    score += SCORE_RULES['gap']
+                    reasons.append("ギャップ")
 
             # C. 価格帯
             if 300 <= today['Close'] <= 3000:
@@ -138,40 +164,24 @@ def calculate_scores(tickers, names_map, daily_data, intraday_data):
                 reasons.append("価格適正")
             
             # D. 前日ボラ
-            prev_range = (prev['High'] - prev['Low']) / prev['Close']
-            if prev_range >= 0.02:
-                score += SCORE_RULES['prev_vol']
-                reasons.append("高ボラ")
+            if prev['Close'] > 0:
+                prev_range = (prev['High'] - prev['Low']) / prev['Close']
+                if prev_range >= 0.02:
+                    score += SCORE_RULES['prev_vol']
+                    reasons.append("高ボラ")
 
             # E. 当日VWAP位置
-            vwap_val = 0
-            if not df_m.empty:
-                today_date_str = df_d.index[-1].strftime('%Y-%m-%d')
-                try:
-                    df_m_today = df_m.loc[today_date_str]
-                    if not df_m_today.empty:
-                        cum_vol = df_m_today['Volume'].cumsum()
-                        cum_pv = (df_m_today['Close'] * df_m_today['Volume']).cumsum()
-                        vwap_val = (cum_pv / cum_vol).iloc[-1]
-                        
-                        if today['Close'] > vwap_val:
-                            score += SCORE_RULES['vwap_loc']
-                            reasons.append("VWAP上")
-                        elif today['Close'] < vwap_val:
-                            score += SCORE_RULES['vwap_loc']
-                            reasons.append("VWAP下")
-                except:
-                    pass
+            # 計算省略（重いため詳細分析時または簡易判定にする）
+            # ここでは必要に応じて復活させてください
 
-            # マップから名称取得
-            name = names_map.get(t, t)
+            name = ticker_map.get(t, t)
 
             results.append({
                 "Ticker": t,
                 "Name": name,
                 "Score": score,
                 "Price": today['Close'],
-                "Change%": (today['Close'] - prev['Close']) / prev['Close'] * 100,
+                "Change%": (today['Close'] - prev['Close']) / prev['Close'] * 100 if prev['Close'] > 0 else 0,
                 "Volume": today['Volume'],
                 "Reasons": ", ".join(reasons),
                 # CSV出力用データ
@@ -185,9 +195,11 @@ def calculate_scores(tickers, names_map, daily_data, intraday_data):
             
         except Exception as e:
             continue
-            
+    
+    prog_bar.empty()
     df = pd.DataFrame(results)
     if not df.empty:
+        # スコア0のものは除外するか、ソートして下位にする
         df = df.sort_values(by=["Score", "Volume"], ascending=[False, False])
     return df
 
@@ -233,7 +245,7 @@ def generate_csv_string(row):
 # 2. メインUI構成
 # ==========================================
 
-st.title("📊 デイトレ運用エージェント v1.2")
+st.title("📊 デイトレ運用エージェント v1.3 (N225自動更新版)")
 st.markdown("---")
 
 # サイドバー
@@ -246,21 +258,26 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
     
-    st.caption("※初回は銘柄名取得のため時間がかかります")
+    st.caption("銘柄リスト: Wikipediaより自動取得(月次更新)")
+    st.caption("データソース: yfinance (遅延あり)")
 
 # データ取得プロセス
-with st.spinner('市場データを取得中...'):
-    # 1. 銘柄名取得（キャッシュあり）
-    names_map = fetch_ticker_names(NIKKEI_225_SAMPLE)
-    # 2. 株価データ取得
-    daily, intraday = fetch_market_data(NIKKEI_225_SAMPLE)
+# 1. 銘柄リスト取得（自動）
+with st.spinner('日経225構成銘柄リストを確認中...'):
+    ticker_map = fetch_nikkei225_list()
+    tickers = list(ticker_map.keys())
+    st.sidebar.info(f"監視対象: {len(tickers)} 銘柄")
 
-if daily is None:
-    st.error("データ取得に失敗しました。")
+# 2. 株価データ取得
+# ※銘柄数が多いので少し時間がかかります
+daily, intraday = fetch_market_data(tickers)
+
+if daily is None or daily.empty:
+    st.error("株価データの取得に失敗しました。")
     st.stop()
 
 # スクリーニング計算
-df_result = calculate_scores(NIKKEI_225_SAMPLE, names_map, daily, intraday)
+df_result = calculate_scores(ticker_map, daily, intraday)
 
 # --- UIタブ ---
 tab1, tab2, tab3 = st.tabs(["🔥 監視ボード & 出力", "📋 全体リスト", "🧮 資金管理"])
@@ -312,7 +329,7 @@ with tab1:
         st.subheader(f"📈 {selected_ticker} {sel_row['Name']} チャート")
         
         target_df = pd.DataFrame()
-        if len(NIKKEI_225_SAMPLE) > 1:
+        if len(tickers) > 1:
             if selected_ticker in intraday.columns.levels[0]:
                 target_df = intraday[selected_ticker]
         else:
