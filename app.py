@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
+import os
 
 # ==========================================
 # 0. 設定・定数定義
@@ -18,46 +19,44 @@ SCORE_RULES = {
     "vwap_loc": 1      # VWAP位置
 }
 
+# CSVファイル名
+CSV_FILE = "nikkei225.csv"
+
 # ==========================================
 # 1. データ取得・ロジック関数
 # ==========================================
 
-@st.cache_data(ttl=2592000) # 30日間キャッシュ（月次更新イメージ）
+@st.cache_data
 def fetch_nikkei225_list():
     """
-    Wikipediaから日経225構成銘柄リスト（コード・社名）を取得する
+    ローカルのCSVファイルから日経225構成銘柄リストを読み込む
+    想定CSVフォーマット: code,name (ヘッダーあり)
     """
-    url = "https://en.wikipedia.org/wiki/Nikkei_225"
+    if not os.path.exists(CSV_FILE):
+        st.error(f"エラー: '{CSV_FILE}' が見つかりません。同じフォルダに配置してください。")
+        st.stop()
+
     try:
-        # htmlのテーブルを読み込む
-        dfs = pd.read_html(url)
-        # 通常、最初のテーブルが構成銘柄リスト
-        df = dfs[0]
+        # code列を文字列として読み込む（先頭の0落ち防止等は日本株では稀だが念のため）
+        df = pd.read_csv(CSV_FILE, dtype={'code': str})
         
-        # 必要なカラム: 'Ticker' (コード) と 'Company' (社名)
-        # コードに ".T" を付与し、社名との辞書を作成
         ticker_map = {}
         for _, row in df.iterrows():
-            code = str(row['Ticker'])
-            name = row['Company']
+            code = str(row['code']).strip()
+            name = str(row['name']).strip()
+            # yfinance用に ".T" を付与
             ticker_map[f"{code}.T"] = name
             
         return ticker_map
     
     except Exception as e:
-        st.error(f"銘柄リストの取得に失敗しました: {e}")
-        # 失敗時のフォールバック（主要銘柄のみ）
-        return {
-            "7203.T": "Toyota Motor", "9984.T": "SoftBank Group",
-            "8035.T": "Tokyo Electron", "6758.T": "Sony Group",
-            "8306.T": "Mitsubishi UFJ"
-        }
+        st.error(f"CSVファイルの読み込みエラー: {e}")
+        st.stop()
 
 @st.cache_data(ttl=60) 
 def fetch_market_data(tickers):
     """
     株価データの取得
-    225銘柄一括取得のため、ダウンロード処理を最適化
     """
     if not tickers:
         return None, None
@@ -97,23 +96,23 @@ def calculate_scores(ticker_map, daily_data, intraday_data):
     results = []
     tickers = list(ticker_map.keys())
     
-    # プログレスバーで計算状況を表示
+    # プログレスバー
     prog_bar = st.progress(0, text="スコア計算中...")
     total_len = len(tickers)
 
     for i, t in enumerate(tickers):
         try:
-            # プログレス更新（10銘柄ごとに更新して負荷軽減）
+            # プログレス更新（10銘柄ごとに更新）
             if i % 10 == 0:
                 prog_bar.progress((i / total_len), text=f"分析中... ({i}/{total_len})")
 
-            # データ切り出し（MultiIndex対応）
+            # データ切り出し
             if len(tickers) > 1:
-                # 銘柄がデータに含まれているか確認
+                # 日足データ確認
                 if t not in daily_data.columns.levels[0]: continue
                 df_d = daily_data[t]
                 
-                # 分足チェック
+                # 分足データ確認
                 if t in intraday_data.columns.levels[0]:
                     df_m = intraday_data[t]
                 else:
@@ -130,6 +129,7 @@ def calculate_scores(ticker_map, daily_data, intraday_data):
             
             # --- 数値計算 ---
             prev_vol = prev['Volume']
+            
             # 5日平均出来高
             if len(df_d) >= 6:
                 avg_vol_5d = df_d['Volume'].iloc[-6:-1].mean()
@@ -170,10 +170,6 @@ def calculate_scores(ticker_map, daily_data, intraday_data):
                     score += SCORE_RULES['prev_vol']
                     reasons.append("高ボラ")
 
-            # E. 当日VWAP位置
-            # 計算省略（重いため詳細分析時または簡易判定にする）
-            # ここでは必要に応じて復活させてください
-
             name = ticker_map.get(t, t)
 
             results.append({
@@ -199,7 +195,6 @@ def calculate_scores(ticker_map, daily_data, intraday_data):
     prog_bar.empty()
     df = pd.DataFrame(results)
     if not df.empty:
-        # スコア0のものは除外するか、ソートして下位にする
         df = df.sort_values(by=["Score", "Volume"], ascending=[False, False])
     return df
 
@@ -245,7 +240,7 @@ def generate_csv_string(row):
 # 2. メインUI構成
 # ==========================================
 
-st.title("📊 デイトレ運用エージェント v1.3 (N225自動更新版)")
+st.title("📊 デイトレ運用エージェント v1.4 (CSV読込版)")
 st.markdown("---")
 
 # サイドバー
@@ -258,18 +253,17 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
     
-    st.caption("銘柄リスト: Wikipediaより自動取得(月次更新)")
+    st.caption(f"銘柄リスト: {CSV_FILE}")
     st.caption("データソース: yfinance (遅延あり)")
 
 # データ取得プロセス
-# 1. 銘柄リスト取得（自動）
-with st.spinner('日経225構成銘柄リストを確認中...'):
-    ticker_map = fetch_nikkei225_list()
-    tickers = list(ticker_map.keys())
-    st.sidebar.info(f"監視対象: {len(tickers)} 銘柄")
+# 1. CSVから銘柄リスト読み込み
+ticker_map = fetch_nikkei225_list()
+tickers = list(ticker_map.keys())
+st.sidebar.info(f"監視対象: {len(tickers)} 銘柄")
 
 # 2. 株価データ取得
-# ※銘柄数が多いので少し時間がかかります
+# ※API負荷軽減のため、キャッシュを有効活用
 daily, intraday = fetch_market_data(tickers)
 
 if daily is None or daily.empty:
@@ -309,15 +303,12 @@ with tab1:
         # === 銘柄選択・CSV出力 ===
         st.subheader("📋 データ出力 (CSV Copy)")
         
-        # 選択肢作成
         options = df_result.apply(lambda x: f"{x['Ticker']} {x['Name']} (Score:{x['Score']})", axis=1).tolist()
         selected_option = st.selectbox("詳細表示・出力する銘柄を選択:", options)
         
-        # データ抽出
         selected_ticker = selected_option.split(" ")[0]
         sel_row = df_result[df_result['Ticker'] == selected_ticker].iloc[0]
         
-        # CSV生成
         csv_text = generate_csv_string(sel_row)
         
         st.caption("以下のテキストをコピーしてください（右上のアイコンでコピー可）")
