@@ -9,19 +9,19 @@ from datetime import datetime, timedelta
 # ==========================================
 st.set_page_config(page_title="デイトレ運用エージェント", layout="wide")
 
-# サンプルとして主要銘柄のみ記載。
-# 本番運用時はここに日経225全銘柄のコード（末尾に.T）を記述してください。
+# 監視対象リスト（コードのみ定義）
+# ※本番ではここに日経225全銘柄を入れてください
 NIKKEI_225_SAMPLE = [
     "7203.T", "9984.T", "8035.T", "6758.T", "6861.T", 
     "6098.T", "6920.T", "4063.T", "7741.T", "8058.T",
     "5401.T", "8306.T", "9432.T", "7011.T", "6501.T"
 ]
 
-# スコア計算ルール（変更可能）
+# スコア計算ルール
 SCORE_RULES = {
     "volume_accel": 2, # 出来高加速
     "gap": 1,          # ギャップ
-    "price_range": 1,  # 価格帯(300-3000)
+    "price_range": 1,  # 価格帯
     "prev_vol": 1,     # 前日ボラ
     "vwap_loc": 1      # VWAP位置
 }
@@ -30,38 +30,73 @@ SCORE_RULES = {
 # 1. データ取得・ロジック関数
 # ==========================================
 
-@st.cache_data(ttl=60) # 1分間キャッシュしてAPI負荷軽減
+@st.cache_data(ttl=86400) # 銘柄名は24時間キャッシュ（遅いため）
+def fetch_ticker_names(tickers):
+    """yfinanceから銘柄名を取得する"""
+    name_map = {}
+    # プログレスバー表示（銘柄数が多いと時間がかかるため）
+    progress_text = "銘柄情報を取得中..."
+    my_bar = st.progress(0, text=progress_text)
+    
+    total = len(tickers)
+    for i, t in enumerate(tickers):
+        try:
+            # yfinanceのTickerオブジェクトから情報取得
+            ticker_info = yf.Ticker(t).info
+            # 日本語の省略名(shortName)があればそれを、なければlongName、なければコード
+            name = ticker_info.get('shortName', ticker_info.get('longName', t))
+            name_map[t] = name
+        except Exception:
+            name_map[t] = t
+        
+        # プログレスバー更新
+        my_bar.progress((i + 1) / total, text=f"{progress_text} ({i+1}/{total})")
+    
+    my_bar.empty() # バーを消す
+    return name_map
+
+@st.cache_data(ttl=60) 
 def fetch_market_data(tickers):
-    """yfinanceからデータ取得（日足5日分、分足1日分）"""
+    """株価データの取得"""
     if not tickers:
         return None, None
     
-    # 日足（前日比較用）
+    # 日足（5日分）
     daily_data = yf.download(
         tickers, period="5d", interval="1d", 
         group_by='ticker', auto_adjust=True, progress=False, threads=True
     )
     
-    # 分足（当日監視用）
-    # ※yfinanceの制約：日本株の分足は取得できない場合や遅延が大きい場合があります
+    # 分足（5日分：前日VWAP計算のため）
     intraday_data = yf.download(
-        tickers, period="1d", interval="1m", 
+        tickers, period="5d", interval="1m", 
         group_by='ticker', auto_adjust=True, progress=False, threads=True
     )
     
     return daily_data, intraday_data
 
-def calculate_scores(tickers, daily_data, intraday_data):
-    """スクリーニングとスコア計算を実行"""
+def get_prev_vwap(df_m, prev_date_str):
+    """前日の分足データからVWAPを計算"""
+    try:
+        prev_day_data = df_m.loc[prev_date_str]
+        if prev_day_data.empty:
+            return 0
+        v = prev_day_data['Volume']
+        p = prev_day_data['Close']
+        vwap = (p * v).sum() / v.sum()
+        return vwap
+    except:
+        return 0
+
+def calculate_scores(tickers, names_map, daily_data, intraday_data):
+    """スクリーニングと各種数値の計算"""
     results = []
     
     for t in tickers:
         try:
-            # データ切り出し（MultiIndex対応）
-            # 単一銘柄指定などの場合で構造が変わるため調整
+            # データ切り出し
             if len(tickers) > 1:
                 df_d = daily_data[t]
-                # 分足が存在しない場合のハンドリング
                 df_m = intraday_data[t] if t in intraday_data.columns.levels[0] else pd.DataFrame()
             else:
                 df_d = daily_data
@@ -71,59 +106,81 @@ def calculate_scores(tickers, daily_data, intraday_data):
 
             today = df_d.iloc[-1]
             prev = df_d.iloc[-2]
+            prev_date = df_d.index[-2].strftime('%Y-%m-%d')
             
-            # --- スコア判定ロジック ---
+            # --- 数値計算 ---
+            prev_vol = prev['Volume']
+            avg_vol_5d = df_d['Volume'].iloc[-6:-1].mean()
+            if pd.isna(avg_vol_5d): avg_vol_5d = prev_vol
+
+            prev_vwap = get_prev_vwap(df_m, prev_date)
+            if prev_vwap == 0:
+                prev_vwap = (prev['High'] + prev['Low'] + prev['Close']) / 3
+
+            # --- スコア判定 ---
             score = 0
             reasons = []
 
-            # 1. 出来高加速
-            avg_vol_5d = df_d['Volume'].tail(5).mean()
-            if prev['Volume'] >= avg_vol_5d * 1.2:
+            # A. 出来高加速
+            if prev_vol >= avg_vol_5d * 1.2:
                 score += SCORE_RULES['volume_accel']
                 reasons.append("出来高増")
 
-            # 2. ギャップ (始値 vs 前日終値)
+            # B. ギャップ
             gap_rate = (today['Open'] - prev['Close']) / prev['Close']
             if abs(gap_rate) >= 0.007:
                 score += SCORE_RULES['gap']
                 reasons.append("ギャップ")
 
-            # 3. 価格帯
+            # C. 価格帯
             if 300 <= today['Close'] <= 3000:
                 score += SCORE_RULES['price_range']
                 reasons.append("価格適正")
             
-            # 4. 前日ボラティリティ
+            # D. 前日ボラ
             prev_range = (prev['High'] - prev['Low']) / prev['Close']
             if prev_range >= 0.02:
                 score += SCORE_RULES['prev_vol']
                 reasons.append("高ボラ")
 
-            # 5. VWAP位置 (分足がある場合のみ)
+            # E. 当日VWAP位置
             vwap_val = 0
             if not df_m.empty:
-                # VWAP計算
-                cum_vol = df_m['Volume'].cumsum()
-                cum_pv = (df_m['Close'] * df_m['Volume']).cumsum()
-                vwap_series = cum_pv / cum_vol
-                vwap_val = vwap_series.iloc[-1]
-                
-                if today['Close'] > vwap_val:
-                    score += SCORE_RULES['vwap_loc']
-                    reasons.append("VWAP上")
-                elif today['Close'] < vwap_val:
-                    score += SCORE_RULES['vwap_loc']
-                    reasons.append("VWAP下")
+                today_date_str = df_d.index[-1].strftime('%Y-%m-%d')
+                try:
+                    df_m_today = df_m.loc[today_date_str]
+                    if not df_m_today.empty:
+                        cum_vol = df_m_today['Volume'].cumsum()
+                        cum_pv = (df_m_today['Close'] * df_m_today['Volume']).cumsum()
+                        vwap_val = (cum_pv / cum_vol).iloc[-1]
+                        
+                        if today['Close'] > vwap_val:
+                            score += SCORE_RULES['vwap_loc']
+                            reasons.append("VWAP上")
+                        elif today['Close'] < vwap_val:
+                            score += SCORE_RULES['vwap_loc']
+                            reasons.append("VWAP下")
+                except:
+                    pass
+
+            # マップから名称取得
+            name = names_map.get(t, t)
 
             results.append({
                 "Ticker": t,
+                "Name": name,
                 "Score": score,
-                "Price": f"{today['Close']:.0f}",
-                "Change%": f"{(today['Close'] - prev['Close']) / prev['Close'] * 100:.2f}%",
-                "Volume": f"{today['Volume']:,}",
+                "Price": today['Close'],
+                "Change%": (today['Close'] - prev['Close']) / prev['Close'] * 100,
+                "Volume": today['Volume'],
                 "Reasons": ", ".join(reasons),
-                "RawPrice": today['Close'], # ソート用
-                "RawVol": today['Volume']   # ソート用
+                # CSV出力用データ
+                "PrevVol": prev_vol,
+                "AvgVol5d": avg_vol_5d,
+                "PrevClose": prev['Close'],
+                "PrevHigh": prev['High'],
+                "PrevLow": prev['Low'],
+                "PrevVWAP": prev_vwap
             })
             
         except Exception as e:
@@ -131,176 +188,177 @@ def calculate_scores(tickers, daily_data, intraday_data):
             
     df = pd.DataFrame(results)
     if not df.empty:
-        df = df.sort_values(by=["Score", "RawVol"], ascending=[False, False])
+        df = df.sort_values(by=["Score", "Volume"], ascending=[False, False])
     return df
 
-def draw_candle_chart(ticker, df_m):
-    """Plotlyでローソク足チャートを描画"""
+def draw_candle_chart(ticker, name, df_m):
+    """Plotlyでチャート描画"""
     if df_m.empty:
         st.warning("分足データがありません。")
         return
 
+    last_date = df_m.index[-1].date()
+    df_plot = df_m[df_m.index.date == last_date]
+
     fig = go.Figure(data=[go.Candlestick(
-        x=df_m.index,
-        open=df_m['Open'],
-        high=df_m['High'],
-        low=df_m['Low'],
-        close=df_m['Close'],
+        x=df_plot.index,
+        open=df_plot['Open'], high=df_plot['High'],
+        low=df_plot['Low'], close=df_plot['Close'],
         name=ticker
     )])
     
-    # VWAP追加
-    cum_vol = df_m['Volume'].cumsum()
-    cum_pv = (df_m['Close'] * df_m['Volume']).cumsum()
+    # VWAP
+    cum_vol = df_plot['Volume'].cumsum()
+    cum_pv = (df_plot['Close'] * df_plot['Volume']).cumsum()
     vwap = cum_pv / cum_vol
     
     fig.add_trace(go.Scatter(
-        x=df_m.index, y=vwap, mode='lines', name='VWAP', line=dict(color='orange', width=1.5)
+        x=df_plot.index, y=vwap, mode='lines', name='VWAP', line=dict(color='orange', width=1.5)
     ))
 
     fig.update_layout(
-        title=f"{ticker} 1分足 + VWAP",
-        xaxis_title="Time",
-        yaxis_title="Price",
-        height=400,
+        title=f"{ticker} {name} 本日の推移",
+        xaxis_title="Time", yaxis_title="Price", height=400,
         margin=dict(l=20, r=20, t=40, b=20)
     )
     st.plotly_chart(fig, use_container_width=True)
+
+def generate_csv_string(row):
+    """指定フォーマットのCSV文字列を生成"""
+    return (f"{row['Ticker']}, {row['Name']}, {int(row['PrevVol'])}, {int(row['AvgVol5d'])}, "
+            f"{int(row['Price'])}, {int(row['PrevClose'])}, {int(row['PrevHigh'])}, "
+            f"{int(row['PrevLow'])}, {int(row['PrevVWAP'])}")
 
 # ==========================================
 # 2. メインUI構成
 # ==========================================
 
-st.title("📊 デイトレード運用エージェント")
+st.title("📊 デイトレ運用エージェント v1.2")
 st.markdown("---")
 
-# サイドバー設定
+# サイドバー
 with st.sidebar:
-    st.header("⚙️ 設定・入力")
+    st.header("⚙️ 設定")
     capital = st.number_input("元手資金 (円)", value=400000, step=10000)
-    risk_val = st.number_input("1回あたり許容損失 (円)", value=4000, step=500)
+    risk_val = st.number_input("1回許容損失 (円)", value=4000, step=500)
     
-    st.markdown("---")
-    if st.button("データ更新 / スクリーニング実行"):
-        st.cache_data.clear() # キャッシュクリアして再取得
+    if st.button("データ更新 / 再計算", type="primary"):
+        st.cache_data.clear()
         st.rerun()
-        
-    st.info("※ yfinanceのデータは15-20分遅延します。発注は必ず証券会社のツールで行ってください。")
+    
+    st.caption("※初回は銘柄名取得のため時間がかかります")
 
-# データロード
+# データ取得プロセス
 with st.spinner('市場データを取得中...'):
+    # 1. 銘柄名取得（キャッシュあり）
+    names_map = fetch_ticker_names(NIKKEI_225_SAMPLE)
+    # 2. 株価データ取得
     daily, intraday = fetch_market_data(NIKKEI_225_SAMPLE)
 
 if daily is None:
     st.error("データ取得に失敗しました。")
     st.stop()
 
-# スクリーニング実行
-df_result = calculate_scores(NIKKEI_225_SAMPLE, daily, intraday)
+# スクリーニング計算
+df_result = calculate_scores(NIKKEI_225_SAMPLE, names_map, daily, intraday)
 
-# --- タブ構成 ---
-tab1, tab2, tab3 = st.tabs(["🔥 監視ダッシュボード", "📋 全体ランキング", "🧮 資金管理・計算機"])
+# --- UIタブ ---
+tab1, tab2, tab3 = st.tabs(["🔥 監視ボード & 出力", "📋 全体リスト", "🧮 資金管理"])
 
 # ----------------------------------------------------
-# TAB 1: 監視ダッシュボード (上位3銘柄)
+# TAB 1: 監視ボード & データ出力
 # ----------------------------------------------------
 with tab1:
-    st.header("Today's Top Picks (上位3銘柄)")
-    
     if df_result.empty:
-        st.warning("該当銘柄がありません。")
+        st.warning("該当銘柄なし")
     else:
+        st.subheader("Today's Top Picks")
         top3 = df_result.head(3)
         
-        # 3カラムでカード表示
         cols = st.columns(3)
         for i, (index, row) in enumerate(top3.iterrows()):
             with cols[i]:
-                # カード風デザイン
                 st.markdown(f"""
-                <div style="border:1px solid #444; padding:15px; border-radius:10px; background-color:#262730;">
-                    <h3 style="margin:0;">{row['Ticker']}</h3>
-                    <h2 style="color:#00FFAA; margin:0;">¥{row['Price']}</h2>
-                    <p style="color:#FFDD00;">Score: {row['Score']}点</p>
-                    <p>前日比: {row['Change%']}</p>
-                    <small>{row['Reasons']}</small>
+                <div style="border:1px solid #555; padding:15px; border-radius:10px; background-color:#262730; margin-bottom:10px;">
+                    <div style="font-size:0.9em; color:#ccc;">{row['Ticker']}</div>
+                    <div style="font-size:1.2em; font-weight:bold;">{row['Name']}</div>
+                    <div style="color:#00FFAA; font-size:1.5em; font-weight:bold;">¥{row['Price']:.0f}</div>
+                    <div style="color:#FFDD00;">Score: {row['Score']}</div>
                 </div>
                 """, unsafe_allow_html=True)
-                
-                # 個別チャート表示ボタン
-                if st.button(f"詳細チャート: {row['Ticker']}", key=f"btn_{i}"):
-                    st.session_state['selected_ticker'] = row['Ticker']
-
+        
         st.markdown("---")
         
-        # 詳細チャートエリア（ボタンで選択された銘柄を表示）
-        if 'selected_ticker' in st.session_state:
-            sel_t = st.session_state['selected_ticker']
-            st.subheader(f"📈 {sel_t} リアルタイム分析")
+        # === 銘柄選択・CSV出力 ===
+        st.subheader("📋 データ出力 (CSV Copy)")
+        
+        # 選択肢作成
+        options = df_result.apply(lambda x: f"{x['Ticker']} {x['Name']} (Score:{x['Score']})", axis=1).tolist()
+        selected_option = st.selectbox("詳細表示・出力する銘柄を選択:", options)
+        
+        # データ抽出
+        selected_ticker = selected_option.split(" ")[0]
+        sel_row = df_result[df_result['Ticker'] == selected_ticker].iloc[0]
+        
+        # CSV生成
+        csv_text = generate_csv_string(sel_row)
+        
+        st.caption("以下のテキストをコピーしてください（右上のアイコンでコピー可）")
+        st.code(csv_text, language="csv")
+        st.info("順序: コード, 名称, 前日出来高, 5日平均, 現在値, 前日終値, 前日高値, 前日安値, 前日VWAP")
+
+        # チャート描画
+        st.markdown("---")
+        st.subheader(f"📈 {selected_ticker} {sel_row['Name']} チャート")
+        
+        target_df = pd.DataFrame()
+        if len(NIKKEI_225_SAMPLE) > 1:
+            if selected_ticker in intraday.columns.levels[0]:
+                target_df = intraday[selected_ticker]
+        else:
+            target_df = intraday
             
-            # 分足データがあるか確認して描画
-            target_df = pd.DataFrame()
-            if len(NIKKEI_225_SAMPLE) > 1:
-                if sel_t in intraday.columns.levels[0]:
-                    target_df = intraday[sel_t]
-            else:
-                target_df = intraday
-                
-            draw_candle_chart(sel_t, target_df)
+        draw_candle_chart(selected_ticker, sel_row['Name'], target_df)
 
 # ----------------------------------------------------
-# TAB 2: 全体ランキング
+# TAB 2: 全体リスト
 # ----------------------------------------------------
 with tab2:
-    st.header("スクリーニング結果一覧")
-    # 表示用カラムに絞る
-    display_df = df_result[["Ticker", "Score", "Price", "Change%", "Volume", "Reasons"]]
-    st.dataframe(display_df, use_container_width=True, height=500)
+    st.header("全スクリーニング結果")
+    disp_cols = ["Ticker", "Name", "Score", "Price", "Change%", "Volume", "Reasons"]
+    st.dataframe(
+        df_result[disp_cols].style.format({
+            "Price": "{:.0f}", "Change%": "{:.2f}%", "Volume": "{:,.0f}"
+        }), 
+        use_container_width=True, height=600
+    )
 
 # ----------------------------------------------------
-# TAB 3: 資金管理・計算機
+# TAB 3: 資金管理
 # ----------------------------------------------------
 with tab3:
-    st.header("🧮 エントリープラン計算機")
-    
+    st.header("🧮 エントリー計算機")
     c1, c2 = st.columns(2)
     with c1:
-        calc_ticker = st.selectbox("銘柄選択", df_result['Ticker'].tolist())
-        # 選択銘柄の現在値をデフォルトに
-        curr_price_val = float(df_result[df_result['Ticker']==calc_ticker]['RawPrice'].values[0])
-        entry_price = st.number_input("エントリー価格", value=curr_price_val, step=1.0)
-        
+        calc_ticker_raw = st.selectbox("計算対象", options)
+        calc_ticker = calc_ticker_raw.split(" ")[0]
+        row_data = df_result[df_result['Ticker']==calc_ticker].iloc[0]
+        entry_price = st.number_input("エントリー価格", value=float(row_data['Price']), step=1.0)
     with c2:
         sl_pct = st.slider("損切り幅 (%)", 0.1, 2.0, 0.6, 0.1)
-        risk_money = st.number_input("許容リスク額 (自動反映)", value=risk_val, disabled=True)
+        st.metric("許容リスク額", f"{risk_val:,} 円")
 
-    st.markdown("### 📋 トレード計画")
-    
     if entry_price > 0:
-        # 計算ロジック
         sl_price = int(entry_price * (1 - sl_pct/100))
         loss_per_share = entry_price - sl_price
-        
         if loss_per_share > 0:
-            # 枚数計算 (許容リスク ÷ 1株あたり損失)
-            max_shares = int(risk_money / loss_per_share)
-            # 単元(100株)で丸め
+            max_shares = int(risk_val / loss_per_share)
             shares = (max_shares // 100) * 100
-            if shares == 0: shares = 100 # 最低1単元
-            
+            if shares == 0: shares = 100
             total_risk = loss_per_share * shares
             tp_2r = int(entry_price + (loss_per_share * 2))
-            tp_3r = int(entry_price + (loss_per_share * 3))
             
-            # 結果表示
-            res_col1, res_col2, res_col3 = st.columns(3)
-            with res_col1:
-                st.error(f"損切り(SL)\n# {sl_price} 円")
-                st.caption(f"損失額: -{total_risk:,} 円")
-            with res_col2:
-                st.info(f"適正株数\n# {shares} 株")
-                st.caption(f"建玉額: {int(entry_price * shares):,} 円")
-            with res_col3:
-                st.success(f"利確(TP)\n# 2R: {tp_2r} 円\n# 3R: {tp_3r} 円")
-        else:
-            st.warning("損切り幅が小さすぎます（1Tick以下）")
+            res1, res2, res3 = st.columns(3)
+            res1.error(f"損切り (SL)\n# {sl_price} 円\n(-{total_risk:,}円)")
+            res2.info(f"適正株数\n# {shares} 株\n(約 {int(entry_price*shares/10000)}万円)")
+            res3.success(f"利確 (TP)\n# {tp_2r} 円\n(+{int(total_risk*2):,}円)")
